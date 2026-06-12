@@ -35,6 +35,68 @@ const REQUEST_STATUS_LABELS = {
   rejected: "已驳回",
 };
 
+const STATUS_TRANSITIONS = {
+  [STATUS.IN_STOCK]: [STATUS.TESTING, STATUS.PEST_ISOLATED, STATUS.SHIPPED_OUT],
+  [STATUS.TESTING]: [STATUS.IN_STOCK, STATUS.PEST_ISOLATED],
+  [STATUS.PEST_ISOLATED]: [STATUS.IN_STOCK, STATUS.SCRAPPED],
+  [STATUS.SHIPPED_OUT]: [],
+  [STATUS.SCRAPPED]: [],
+};
+
+const TERMINAL_STATUSES = new Set([STATUS.SHIPPED_OUT, STATUS.SCRAPPED]);
+
+const PEST_DISPOSAL_FIELDS = new Set([
+  "status",
+  "current_weight",
+  "storage_weight",
+]);
+
+function isValidStatusTransition(from, to) {
+  const allowed = STATUS_TRANSITIONS[from];
+  return allowed && allowed.includes(to);
+}
+
+function isTerminalStatus(status) {
+  return TERMINAL_STATUSES.has(status);
+}
+
+function validateStatusChange(batch, newStatus, operation) {
+  if (newStatus === batch.status) return { valid: true };
+
+  if (isTerminalStatus(batch.status)) {
+    return {
+      valid: false,
+      error: `当前状态为"${STATUS_LABELS[batch.status]}"，为终态，不允许修改状态`,
+    };
+  }
+
+  if (!isValidStatusTransition(batch.status, newStatus)) {
+    return {
+      valid: false,
+      error: `不允许从"${STATUS_LABELS[batch.status]}"直接变更为"${STATUS_LABELS[newStatus]}"，请通过正确的业务流程操作`,
+    };
+  }
+
+  return { valid: true };
+}
+
+function validateWeight(batch, newWeight) {
+  if (newWeight < 0) {
+    return { valid: false, error: "库存重量不能为负数" };
+  }
+  if (newWeight > batch.storage_weight) {
+    return { valid: false, error: "当前库存不能超过入库贮藏重量" };
+  }
+  return { valid: true };
+}
+
+function hasFumigationRecord(batchId) {
+  const count = db
+    .prepare("SELECT COUNT(*) as count FROM fumigations WHERE batch_id = ?")
+    .get(batchId).count;
+  return count > 0;
+}
+
 function addRequestStatusLabel(req) {
   if (req) {
     req.status_label = REQUEST_STATUS_LABELS[req.status] || req.status;
@@ -184,6 +246,36 @@ app.put("/api/batches/:id", (req, res) => {
     .get(req.params.id);
   if (!existing) return res.status(404).json({ error: "批次不存在" });
 
+  if (isTerminalStatus(existing.status)) {
+    return res.status(400).json({
+      error: `当前状态为"${STATUS_LABELS[existing.status]}"，为终态，不允许修改`,
+    });
+  }
+
+  if (req.body.status !== undefined && req.body.status !== existing.status) {
+    return res.status(400).json({
+      error: "通用编辑接口不允许修改状态，请通过对应的业务流程接口操作",
+    });
+  }
+
+  if (
+    req.body.current_weight !== undefined &&
+    req.body.current_weight !== existing.current_weight
+  ) {
+    return res.status(400).json({
+      error: "通用编辑接口不允许修改库存重量，请通过出库或其他业务流程操作",
+    });
+  }
+
+  if (
+    req.body.storage_weight !== undefined &&
+    req.body.storage_weight !== existing.storage_weight
+  ) {
+    return res.status(400).json({
+      error: "入库贮藏重量不允许修改",
+    });
+  }
+
   const {
     mother_tree,
     collection_year,
@@ -191,27 +283,30 @@ app.put("/api/batches/:id", (req, res) => {
     thousand_grain_weight,
     storage_location,
     storage_conditions,
-    status,
   } = req.body;
 
-  const updated = { ...existing, ...req.body };
   db.prepare(
     `
     UPDATE seed_batches SET
       mother_tree = ?, collection_year = ?, purity = ?,
       thousand_grain_weight = ?, storage_location = ?,
-      storage_conditions = ?, status = ?,
+      storage_conditions = ?,
       updated_at = datetime('now', 'localtime')
     WHERE id = ?
   `,
   ).run(
-    updated.mother_tree,
-    updated.collection_year,
-    updated.purity,
-    updated.thousand_grain_weight,
-    updated.storage_location,
-    updated.storage_conditions,
-    updated.status,
+    mother_tree !== undefined ? mother_tree : existing.mother_tree,
+    collection_year !== undefined ? collection_year : existing.collection_year,
+    purity !== undefined ? purity : existing.purity,
+    thousand_grain_weight !== undefined
+      ? thousand_grain_weight
+      : existing.thousand_grain_weight,
+    storage_location !== undefined
+      ? storage_location
+      : existing.storage_location,
+    storage_conditions !== undefined
+      ? storage_conditions
+      : existing.storage_conditions,
     req.params.id,
   );
 
@@ -222,6 +317,17 @@ app.put("/api/batches/:id", (req, res) => {
 });
 
 app.delete("/api/batches/:id", (req, res) => {
+  const existing = db
+    .prepare("SELECT * FROM seed_batches WHERE id = ?")
+    .get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "批次不存在" });
+
+  if (isTerminalStatus(existing.status)) {
+    return res.status(400).json({
+      error: `当前状态为"${STATUS_LABELS[existing.status]}"，为终态，不允许删除`,
+    });
+  }
+
   const info = db
     .prepare("DELETE FROM seed_batches WHERE id = ?")
     .run(req.params.id);
@@ -236,6 +342,12 @@ app.post("/api/batches/:id/inspect", (req, res) => {
 
   const batch = db.prepare("SELECT * FROM seed_batches WHERE id = ?").get(id);
   if (!batch) return res.status(404).json({ error: "批次不存在" });
+
+  if (isTerminalStatus(batch.status)) {
+    return res.status(400).json({
+      error: `当前状态为"${STATUS_LABELS[batch.status]}"，为终态，不允许检测`,
+    });
+  }
 
   if (!["germination", "pest", "full"].includes(inspection_type)) {
     return res
@@ -273,16 +385,18 @@ app.post("/api/batches/:id/inspect", (req, res) => {
 
       if (has_pest) {
         newStatus = STATUS.PEST_ISOLATED;
-      } else if (
-        batch.status === STATUS.PEST_ISOLATED ||
-        batch.status === STATUS.TESTING
-      ) {
+      } else if (batch.status === STATUS.TESTING) {
         newStatus = STATUS.IN_STOCK;
       }
     }
 
     if (inspection_type === "full" && batch.status === STATUS.TESTING) {
       if (!has_pest) newStatus = STATUS.IN_STOCK;
+    }
+
+    const statusCheck = validateStatusChange(batch, newStatus, "检测");
+    if (!statusCheck.valid) {
+      throw new Error(statusCheck.error);
     }
 
     db.prepare(
@@ -319,6 +433,18 @@ app.post("/api/batches/:id/fumigate", (req, res) => {
   const batch = db.prepare("SELECT * FROM seed_batches WHERE id = ?").get(id);
   if (!batch) return res.status(404).json({ error: "批次不存在" });
 
+  if (isTerminalStatus(batch.status)) {
+    return res.status(400).json({
+      error: `当前状态为"${STATUS_LABELS[batch.status]}"，为终态，不允许熏蒸`,
+    });
+  }
+
+  if (batch.status !== STATUS.PEST_ISOLATED) {
+    return res.status(400).json({
+      error: `当前状态为"${STATUS_LABELS[batch.status]}"，只有虫害隔离状态的批次才能进行熏蒸处理`,
+    });
+  }
+
   if (!method || !duration_hours) {
     return res.status(400).json({ error: "缺少熏蒸方法或时长" });
   }
@@ -338,7 +464,7 @@ app.post("/api/batches/:id/fumigate", (req, res) => {
     .prepare("SELECT * FROM fumigations WHERE id = ?")
     .get(info.lastInsertRowid);
   res.status(201).json({
-    message: "熏蒸处理记录已创建",
+    message: "熏蒸处理记录已创建，请进行复检确认效果",
     fumigation,
   });
 });
@@ -350,8 +476,20 @@ app.post("/api/batches/:id/reinspect", (req, res) => {
   const batch = db.prepare("SELECT * FROM seed_batches WHERE id = ?").get(id);
   if (!batch) return res.status(404).json({ error: "批次不存在" });
 
+  if (isTerminalStatus(batch.status)) {
+    return res.status(400).json({
+      error: `当前状态为"${STATUS_LABELS[batch.status]}"，为终态，不允许复检`,
+    });
+  }
+
   if (batch.status !== STATUS.PEST_ISOLATED) {
     return res.status(400).json({ error: "只有虫害隔离状态的批次才能复检" });
+  }
+
+  if (!hasFumigationRecord(id)) {
+    return res.status(400).json({
+      error: "该批次尚未进行熏蒸处理，请先完成熏蒸后再复检",
+    });
   }
 
   if (has_pest === undefined) {
@@ -377,6 +515,11 @@ app.post("/api/batches/:id/reinspect", (req, res) => {
       germination_rate !== undefined
         ? germination_rate
         : batch.germination_rate;
+
+    const statusCheck = validateStatusChange(batch, newStatus, "复检");
+    if (!statusCheck.valid) {
+      throw new Error(statusCheck.error);
+    }
 
     db.prepare(
       `
@@ -419,6 +562,12 @@ app.post("/api/batches/:id/outbound", (req, res) => {
   const batch = db.prepare("SELECT * FROM seed_batches WHERE id = ?").get(id);
   if (!batch) return res.status(404).json({ error: "批次不存在" });
 
+  if (isTerminalStatus(batch.status)) {
+    return res.status(400).json({
+      error: `当前状态为"${STATUS_LABELS[batch.status]}"，为终态，无法出库`,
+    });
+  }
+
   if (batch.status !== STATUS.IN_STOCK) {
     return res
       .status(400)
@@ -429,6 +578,12 @@ app.post("/api/batches/:id/outbound", (req, res) => {
     return res.status(400).json({
       error: `库存不足，当前库存 ${batch.current_weight} kg，无法出库 ${quantity} kg`,
     });
+  }
+
+  const newWeight = batch.current_weight - quantity;
+  const weightCheck = validateWeight(batch, newWeight);
+  if (!weightCheck.valid) {
+    return res.status(400).json({ error: weightCheck.error });
   }
 
   const tx = db.transaction(() => {
@@ -450,6 +605,11 @@ app.post("/api/batches/:id/outbound", (req, res) => {
     let newStatus = batch.status;
     if (newWeight <= 0) {
       newStatus = STATUS.SHIPPED_OUT;
+    }
+
+    const statusCheck = validateStatusChange(batch, newStatus, "出库");
+    if (!statusCheck.valid) {
+      throw new Error(statusCheck.error);
     }
 
     db.prepare(
@@ -697,6 +857,12 @@ app.post("/api/seedling-requests", (req, res) => {
     .get(batch_id);
   if (!batch) return res.status(404).json({ error: "批次不存在" });
 
+  if (isTerminalStatus(batch.status)) {
+    return res.status(400).json({
+      error: `批次当前状态为"${STATUS_LABELS[batch.status]}"，为终态，无法提交领用申请`,
+    });
+  }
+
   if (batch.status !== STATUS.IN_STOCK) {
     return res.status(400).json({
       error: `批次当前状态为"${STATUS_LABELS[batch.status]}"，无法提交领用申请`,
@@ -773,6 +939,12 @@ app.post("/api/seedling-requests/:id/approve", (req, res) => {
     .get(request.batch_id);
   if (!batch) return res.status(404).json({ error: "关联批次不存在" });
 
+  if (isTerminalStatus(batch.status)) {
+    return res.status(400).json({
+      error: `批次当前状态为"${STATUS_LABELS[batch.status]}"，为终态，无法审批出库`,
+    });
+  }
+
   if (batch.status !== STATUS.IN_STOCK) {
     return res.status(400).json({
       error: `批次当前状态为"${STATUS_LABELS[batch.status]}"，无法审批通过出库`,
@@ -783,6 +955,12 @@ app.post("/api/seedling-requests/:id/approve", (req, res) => {
     return res.status(400).json({
       error: `库存不足，当前库存 ${batch.current_weight} kg，申请 ${request.quantity} kg`,
     });
+  }
+
+  const newWeight = batch.current_weight - request.quantity;
+  const weightCheck = validateWeight(batch, newWeight);
+  if (!weightCheck.valid) {
+    return res.status(400).json({ error: weightCheck.error });
   }
 
   const tx = db.transaction(() => {
@@ -808,6 +986,11 @@ app.post("/api/seedling-requests/:id/approve", (req, res) => {
     let newStatus = batch.status;
     if (newWeight <= 0) {
       newStatus = STATUS.SHIPPED_OUT;
+    }
+
+    const statusCheck = validateStatusChange(batch, newStatus, "领用审批");
+    if (!statusCheck.valid) {
+      throw new Error(statusCheck.error);
     }
 
     db.prepare(
@@ -1169,6 +1352,39 @@ app.get("/api/status-options", (req, res) => {
   res.json(
     Object.entries(STATUS_LABELS).map(([value, label]) => ({ value, label })),
   );
+});
+
+app.get("/api/status-transitions", (req, res) => {
+  const transitions = {};
+  Object.entries(STATUS_TRANSITIONS).forEach(([from, toList]) => {
+    transitions[from] = {
+      from_label: STATUS_LABELS[from] || from,
+      allowed_to: toList.map((to) => ({
+        value: to,
+        label: STATUS_LABELS[to] || to,
+      })),
+      is_terminal: toList.length === 0,
+    };
+  });
+  res.json({
+    transitions,
+    terminal_statuses: Array.from(TERMINAL_STATUSES).map((s) => ({
+      value: s,
+      label: STATUS_LABELS[s] || s,
+    })),
+    pest_disposal_flow: [
+      { step: 1, status: STATUS.PEST_ISOLATED, label: "检出虫害，转入隔离" },
+      { step: 2, action: "fumigate", label: "熏蒸处理" },
+      { step: 3, action: "reinspect", label: "复检确认" },
+      {
+        step: 4,
+        outcomes: [
+          { status: STATUS.IN_STOCK, label: "复检合格，转回在库" },
+          { status: STATUS.SCRAPPED, label: "复检不合格，予以报废" },
+        ],
+      },
+    ],
+  });
 });
 
 app.use((err, req, res, next) => {
