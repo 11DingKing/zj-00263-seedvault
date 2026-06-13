@@ -337,8 +337,17 @@ app.delete("/api/batches/:id", (req, res) => {
 
 app.post("/api/batches/:id/inspect", (req, res) => {
   const { id } = req.params;
-  const { inspection_type, germination_rate, has_pest, inspector, notes } =
-    req.body;
+  const {
+    inspection_type,
+    germination_rate,
+    has_pest,
+    inspector,
+    notes,
+    fumigation_method,
+    fumigation_duration_hours,
+    fumigation_operator,
+    fumigation_notes,
+  } = req.body;
 
   const batch = db.prepare("SELECT * FROM seed_batches WHERE id = ?").get(id);
   if (!batch) return res.status(404).json({ error: "批次不存在" });
@@ -358,6 +367,7 @@ app.post("/api/batches/:id/inspect", (req, res) => {
   const tx = db.transaction(() => {
     let newStatus = batch.status;
     let germRate = batch.germination_rate;
+    let fumigation = null;
 
     if (inspection_type === "germination" || inspection_type === "full") {
       if (germination_rate === undefined) {
@@ -385,6 +395,26 @@ app.post("/api/batches/:id/inspect", (req, res) => {
 
       if (has_pest) {
         newStatus = STATUS.PEST_ISOLATED;
+
+        const method = fumigation_method || "磷化铝熏蒸";
+        const duration_hours = fumigation_duration_hours || 72;
+        const fumInfo = db
+          .prepare(
+            `
+            INSERT INTO fumigations (batch_id, method, duration_hours, operator, notes)
+            VALUES (?, ?, ?, ?, ?)
+          `,
+          )
+          .run(
+            id,
+            method,
+            duration_hours,
+            fumigation_operator || inspector || null,
+            fumigation_notes || "虫害检出后自动安排熏蒸处理",
+          );
+        fumigation = db
+          .prepare("SELECT * FROM fumigations WHERE id = ?")
+          .get(fumInfo.lastInsertRowid);
       } else if (batch.status === STATUS.TESTING) {
         newStatus = STATUS.IN_STOCK;
       }
@@ -408,7 +438,7 @@ app.post("/api/batches/:id/inspect", (req, res) => {
     `,
     ).run(newStatus, germRate, id);
 
-    return { newStatus, germRate };
+    return { newStatus, germRate, fumigation };
   });
 
   try {
@@ -416,11 +446,18 @@ app.post("/api/batches/:id/inspect", (req, res) => {
     const updated = db
       .prepare("SELECT * FROM seed_batches WHERE id = ?")
       .get(id);
-    res.json({
-      message: has_pest ? "检测出虫害，已自动转入隔离状态" : "检测完成",
+    const response = {
       batch: addStatusLabel(updated),
       pest_isolated: result.newStatus === STATUS.PEST_ISOLATED,
-    });
+    };
+    if (result.fumigation) {
+      response.message =
+        "检测出虫害，已自动转入隔离状态并生成熏蒸处理记录，请待熏蒸完成后进行复检";
+      response.fumigation = result.fumigation;
+    } else {
+      response.message = "检测完成";
+    }
+    res.json(response);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
